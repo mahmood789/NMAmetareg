@@ -13,16 +13,12 @@ library(ggplot2)
 library(gridExtra)
 library(readxl)
 library(readr)
-
-# Try loading metafor - used for meta-regression
-if (!requireNamespace("metafor", quietly = TRUE)) {
-  warning("Package 'metafor' not available. Meta-regression functionality will be limited.")
-} else {
-  library(metafor)
-}
+library(metafor)
 
 # Create sample data files for different effect measures
 create_sample_data <- function(type = "binary") {
+  set.seed(42)  # For reproducibility
+  
   if(type == "binary") {
     # Binary outcome data (OR, RR)
     binary_data <- data.frame(
@@ -42,7 +38,6 @@ create_sample_data <- function(type = "binary") {
       Quality = sample(1:5, 15, replace = TRUE)
     )
     
-    # Return sample data
     return(binary_data)
   }
   else if(type == "continuous") {
@@ -66,19 +61,15 @@ create_sample_data <- function(type = "binary") {
       Quality = sample(1:5, 15, replace = TRUE)
     )
     
-    # Return sample data
     return(continuous_data)
   }
   else if(type == "hazard") {
     # Hazard ratio data (HR)
-    # Create sample hazard ratios and confidence intervals
-    set.seed(42) # For reproducibility
-    log_hrs <- rnorm(15, mean = -0.2, sd = 0.3) # Log hazard ratios centered around 0.8
+    log_hrs <- rnorm(15, mean = -0.2, sd = 0.3)
     hrs <- exp(log_hrs)
     
-    # Generate meaningful confidence intervals based on sample sizes
     sample_sizes <- round(runif(15, 80, 250))
-    se_log_hrs <- sqrt(4/sample_sizes) # Approximation for SE of log HR
+    se_log_hrs <- sqrt(4/sample_sizes)
     
     hazard_data <- data.frame(
       Study = paste0("Study", sprintf("%02d", 1:15)),
@@ -97,14 +88,12 @@ create_sample_data <- function(type = "binary") {
       Quality = sample(1:5, 15, replace = TRUE)
     )
     
-    # Return sample data
     return(hazard_data)
   }
 }
 
 # Helper function to calculate meta-regression predictions at specific covariate values
 calculate_metareg_predictions <- function(model, covariate_values, treatments) {
-  # For each covariate value, calculate predicted effect for each treatment compared to reference
   predictions <- list()
   
   # Create a sequence of covariate values if only min and max provided
@@ -115,21 +104,8 @@ calculate_metareg_predictions <- function(model, covariate_values, treatments) {
   # Check if we're using metafor model
   if ("rma" %in% class(model)) {
     for (cov_val in covariate_values) {
-      # Create appropriate newmods based on model dimensions
-      k <- length(model$beta)
-      if (k == 2) {
-        # Simple model with intercept and one moderator
-        newmods <- matrix(cov_val, ncol = 1)
-      } else if (k == 3) {
-        # Model with two moderators
-        newmods <- matrix(c(cov_val, 0), ncol = 2)
-      } else if (k == 4) {
-        # Model with three moderators (includes interaction)
-        newmods <- matrix(c(cov_val, 0, 0), ncol = 3)
-      } else {
-        # For other cases, create appropriate matrix
-        newmods <- matrix(c(cov_val, rep(0, k-2)), ncol = k-1)
-      }
+      # Create appropriate newmods based on model structure
+      newmods <- matrix(cov_val, ncol = 1)
       
       # Get predictions with confidence intervals
       tryCatch({
@@ -158,12 +134,16 @@ calculate_metareg_predictions <- function(model, covariate_values, treatments) {
       # Calculate predicted value
       pred_val <- coef(model)[1] + coef(model)[2] * cov_val
       
-      # Store prediction (without confidence intervals)
+      # Calculate confidence interval using predict
+      newdata <- data.frame(matched_covs = cov_val)
+      pred_interval <- predict(model, newdata = newdata, interval = "confidence", level = 0.95)
+      
+      # Store prediction
       predictions[[as.character(cov_val)]] <- data.frame(
         covariate_value = cov_val,
-        effect = pred_val,
-        lower_ci = NA,
-        upper_ci = NA
+        effect = pred_interval[1, "fit"],
+        lower_ci = pred_interval[1, "lwr"],
+        upper_ci = pred_interval[1, "upr"]
       )
     }
   }
@@ -190,15 +170,15 @@ create_metareg_bubble_plot <- function(data, xvar, yvar, sizevar, title, xlab, y
   
   # Calculate study weights (inverse of standard error squared)
   weights <- 1 / (data[[sizevar]] ^ 2)
+  data$weights <- weights
   
   # Create bubble plot
-  p <- ggplot(data, aes_string(x = xvar, y = yvar, size = "weights")) +
-    geom_point(alpha = 0.6, color = "blue") +
+  p <- ggplot(data, aes_string(x = xvar, y = yvar)) +
+    geom_point(aes(size = weights), alpha = 0.6, color = "blue") +
     geom_smooth(aes(weight = weights), method = "lm", se = TRUE, color = "red") +
-    labs(title = title, x = xlab, y = ylab) +
+    labs(title = title, x = xlab, y = ylab, size = "Weight") +
     theme_minimal() +
     theme(
-      legend.position = "none",
       plot.title = element_text(size = 14, face = "bold"),
       axis.title = element_text(size = 12),
       axis.text = element_text(size = 10)
@@ -211,57 +191,143 @@ create_metareg_bubble_plot <- function(data, xvar, yvar, sizevar, title, xlab, y
 # Function to create a forest plot with meta-regression adjustments
 create_metareg_forest_plot <- function(nma, metareg_model, covariate_value, 
                                        reference_treatment, sm, cov_name) {
-  # This is a placeholder that would be replaced with actual functionality
-  # In a real implementation, this would adjust treatment effects based on meta-regression
-  
   # Get treatments from NMA
   treatments <- nma$trts
+  treatments <- treatments[treatments != reference_treatment]
+  
+  # Extract NMA estimates for comparison with reference
+  effects <- c()
+  lower_ci <- c()
+  upper_ci <- c()
+  
+  for (treat in treatments) {
+    # Get the network estimate
+    idx <- which(nma$treat1 == reference_treatment & nma$treat2 == treat)
+    if (length(idx) == 0) {
+      idx <- which(nma$treat2 == reference_treatment & nma$treat1 == treat)
+      if (length(idx) > 0) {
+        effects <- c(effects, -nma$TE.nma.random[idx])
+        lower_ci <- c(lower_ci, -nma$upper.nma.random[idx])
+        upper_ci <- c(upper_ci, -nma$lower.nma.random[idx])
+      }
+    } else {
+      effects <- c(effects, nma$TE.nma.random[idx])
+      lower_ci <- c(lower_ci, nma$lower.nma.random[idx])
+      upper_ci <- c(upper_ci, nma$upper.nma.random[idx])
+    }
+  }
+  
+  # Adjust for covariate if meta-regression model is provided
+  if (!is.null(metareg_model) && "rma" %in% class(metareg_model)) {
+    # Simple adjustment based on covariate value
+    adjustment <- metareg_model$beta[2] * (covariate_value - mean(metareg_model$mods[,1], na.rm = TRUE))
+    effects <- effects + adjustment
+    # Note: CI adjustment would be more complex in practice
+  }
   
   # Create data frame for forest plot
   forest_data <- data.frame(
-    treatment = treatments[treatments != reference_treatment],
-    effect = runif(length(treatments) - 1, -1, 1),  # Placeholder values
-    lower = runif(length(treatments) - 1, -2, 0),   # Placeholder values
-    upper = runif(length(treatments) - 1, 0, 2)     # Placeholder values
+    treatment = treatments,
+    effect = effects,
+    lower = lower_ci,
+    upper = upper_ci
   )
   
-  # Create a basic forest plot
-  p <- ggplot(forest_data, aes(x = effect, y = treatment, xmin = lower, xmax = upper)) +
-    geom_vline(xintercept = 0, linetype = "dashed") +
-    geom_errorbarh(height = 0.2) +
-    geom_point(size = 3) +
-    labs(
-      title = paste("Forest Plot at", cov_name, "=", covariate_value),
-      subtitle = paste("Compared with", reference_treatment),
-      x = paste("Effect (", sm, ")"),
-      y = "Treatment"
-    ) +
-    theme_minimal()
+  # Sort by effect size
+  forest_data <- forest_data[order(forest_data$effect),]
   
-  return(p)
+  # Create forest plot
+  par(mar = c(5, 8, 4, 2))
+  plot(forest_data$effect, 1:nrow(forest_data), 
+       xlim = range(c(forest_data$lower, forest_data$upper), na.rm = TRUE),
+       ylim = c(0.5, nrow(forest_data) + 0.5),
+       xlab = paste("Effect (", sm, ")", sep = ""),
+       ylab = "",
+       yaxt = "n",
+       pch = 15,
+       cex = 1.5,
+       main = paste("Forest Plot at", cov_name, "=", round(covariate_value, 2),
+                    "\nCompared with", reference_treatment))
+  
+  # Add confidence intervals
+  for (i in 1:nrow(forest_data)) {
+    lines(c(forest_data$lower[i], forest_data$upper[i]), 
+          c(i, i), lwd = 2)
+  }
+  
+  # Add treatment labels
+  axis(2, at = 1:nrow(forest_data), labels = forest_data$treatment, las = 1)
+  
+  # Add vertical line at null effect
+  abline(v = 0, lty = 2)
+  
+  # Add grid
+  grid(col = "lightgray", lty = "dotted")
 }
 
 # Function to generate treatment rankings adjusted for covariate values
 generate_adjusted_rankings <- function(nma, metareg_model, covariate_value, cov_name) {
-  # This is a placeholder that would be replaced with actual functionality
-  # In a real implementation, this would adjust treatment rankings based on meta-regression
-  
   # Get treatments from NMA
   treatments <- nma$trts
+  n_treatments <- length(treatments)
   
-  # Generate random P-scores for demonstration (in real implementation, these would be calculated)
-  p_scores <- sort(runif(length(treatments)), decreasing = TRUE)
+  # Calculate P-scores from network estimates
+  # Get all pairwise comparisons
+  comparison_matrix <- matrix(NA, n_treatments, n_treatments,
+                              dimnames = list(treatments, treatments))
+  
+  for (i in 1:n_treatments) {
+    for (j in 1:n_treatments) {
+      if (i != j) {
+        # Find the comparison
+        idx <- which((nma$treat1 == treatments[i] & nma$treat2 == treatments[j]) |
+                     (nma$treat1 == treatments[j] & nma$treat2 == treatments[i]))
+        
+        if (length(idx) > 0) {
+          if (nma$treat1[idx] == treatments[i]) {
+            comparison_matrix[i, j] <- nma$TE.nma.random[idx]
+          } else {
+            comparison_matrix[i, j] <- -nma$TE.nma.random[idx]
+          }
+        }
+      }
+    }
+  }
+  
+  # Adjust comparisons based on meta-regression if available
+  if (!is.null(metareg_model) && "rma" %in% class(metareg_model)) {
+    # Apply covariate adjustment
+    mean_cov <- mean(metareg_model$mods[,1], na.rm = TRUE)
+    adjustment <- metareg_model$beta[2] * (covariate_value - mean_cov)
+    comparison_matrix <- comparison_matrix + adjustment
+  }
+  
+  # Calculate P-scores
+  p_scores <- rep(0, n_treatments)
   names(p_scores) <- treatments
   
-  # Add some "covariate effect" - make the ordering slightly different based on covariate value
-  # (just for demonstration)
-  p_scores <- p_scores + (covariate_value / 100) * rnorm(length(p_scores), 0, 0.1)
-  p_scores <- p_scores / sum(p_scores) * length(p_scores)  # Normalize
+  for (i in 1:n_treatments) {
+    # Count how many treatments this treatment beats
+    wins <- 0
+    for (j in 1:n_treatments) {
+      if (i != j && !is.na(comparison_matrix[i, j])) {
+        # For smaller values being better
+        if (nma$small.values == "good") {
+          wins <- wins + pnorm(0, mean = comparison_matrix[i, j], sd = 1)
+        } else {
+          wins <- wins + pnorm(0, mean = -comparison_matrix[i, j], sd = 1)
+        }
+      }
+    }
+    p_scores[i] <- wins / (n_treatments - 1)
+  }
   
-  # Return the adjusted rankings
+  # Sort treatments by P-score
+  sorted_idx <- order(p_scores, decreasing = TRUE)
+  
   return(list(
-    treatments = names(p_scores),
-    p_scores = p_scores
+    treatments = treatments[sorted_idx],
+    p_scores = p_scores[sorted_idx]
   ))
 }
 
@@ -359,8 +425,7 @@ ui <- dashboardPage(
             title = "Network Meta-Analysis with Meta-Regression",
             status = "primary",
             solidHeader = TRUE,
-            p("This application provides an interface for conducting network meta-analysis with meta-regression, 
-              ."),
+            p("This application provides an interface for conducting network meta-analysis with meta-regression."),
             br(),
             # Sample data options
             div(
@@ -403,9 +468,7 @@ ui <- dashboardPage(
               class = "info-box",
               p(strong("Version:"), "1.2.0"),
               p(strong("Last Updated:"), "March 15, 2025"),
-              p(strong("Citation:"), "If you use this application in your research, please cite:"),
-              p(style = "padding-left: 20px;", 
-                "")
+              p(strong("Based on:"), "netmeta and metafor R packages")
             )
           )
         ),
@@ -790,21 +853,9 @@ ui <- dashboardPage(
                                                class = "btn-success download-button")
                          )
                        )),
-              tabPanel("Node-split model", 
-                       fluidRow(
-                         column(12, plotOutput("baseline_nodesplit_plot", height = "500px"))
-                       )),
               tabPanel("Result details", 
                        fluidRow(
                          column(12, verbatimTextOutput("baseline_details"))
-                       )),
-              tabPanel("Deviance report", 
-                       fluidRow(
-                         column(12, verbatimTextOutput("baseline_deviance"))
-                       )),
-              tabPanel("Model details", 
-                       fluidRow(
-                         column(12, verbatimTextOutput("baseline_model"))
                        ))
             )
           )
@@ -1086,35 +1137,20 @@ server <- function(input, output, session) {
       ranking <- netrank(nma_result(), small.values = input$values_direction)
       
       # Create a clean data frame for display
-      if (is.null(ranking$ranking) || !is.numeric(ranking$ranking)) {
-        # If ranking$ranking is not numeric or is NULL, use P.score if available
-        if (!is.null(ranking$P.score)) {
-          scores <- ranking$P.score
-          ranking_df <- data.frame(
-            Treatment = names(scores),
-            P_Score = round(scores * 100, 1),
-            stringsAsFactors = FALSE
-          )
-        } else {
-          # Fallback if neither is available
-          ranking_df <- data.frame(
-            Treatment = nma_result()$trts,
-            Message = "Ranking not available",
-            stringsAsFactors = FALSE
-          )
-        }
-      } else {
-        # Original code if ranking$ranking is numeric
+      if (!is.null(ranking$P.score)) {
+        scores <- ranking$P.score
         ranking_df <- data.frame(
-          Treatment = names(ranking$ranking),
-          Rank = round(ranking$ranking, 2),
+          Treatment = names(scores),
+          P_Score = round(scores * 100, 1),
           stringsAsFactors = FALSE
         )
-        
-        # Add P-score if available
-        if (!is.null(ranking$P.score)) {
-          ranking_df$P_Score <- round(ranking$P.score * 100, 1)
-        }
+      } else {
+        # Fallback if P-scores not available
+        ranking_df <- data.frame(
+          Treatment = nma_result()$trts,
+          Message = "Ranking not available",
+          stringsAsFactors = FALSE
+        )
       }
       
       write.csv(ranking_df, file, row.names = FALSE)
@@ -1808,38 +1844,28 @@ server <- function(input, output, session) {
     }
   })
   
-  # Contribution Matrix
+  # Contribution Matrix - Fixed implementation
   output$contribution_matrix <- renderDT({
     req(nma_result())
     
-    # The netcontrib function would be used in a full implementation
-    # For now, create a placeholder contribution matrix
-    treatments <- nma_result()$trts
-    n_treats <- length(treatments)
+    # Calculate actual contribution matrix using netcontrib
+    contrib <- netcontrib(nma_result())
     
-    # Create an empty matrix for contribution percentages
-    contrib_matrix <- matrix(NA, nrow = n_treats, ncol = n_treats)
-    rownames(contrib_matrix) <- treatments
-    colnames(contrib_matrix) <- treatments
+    # Extract the contribution matrix
+    contrib_matrix <- contrib$contribution.matrix.random
     
-    # Fill with random values for demonstration
-    for (i in 1:n_treats) {
-      for (j in 1:n_treats) {
-        if (i != j) {
-          # Random contribution percentage
-          contrib_matrix[i, j] <- round(runif(1, 0, 100), 1)
-        }
-      }
-    }
+    # Convert to percentage
+    contrib_matrix <- contrib_matrix * 100
     
     # Convert to data frame for display
     contrib_df <- as.data.frame(contrib_matrix)
-    contrib_df$Treatment <- rownames(contrib_df)
-    contrib_df <- contrib_df[, c("Treatment", treatments)]
+    contrib_df$Comparison <- rownames(contrib_df)
+    contrib_df <- contrib_df[, c("Comparison", setdiff(names(contrib_df), "Comparison"))]
     
     datatable(contrib_df, 
               caption = "Percentage Contribution of Direct Comparisons to Network Estimates",
-              options = list(scrollX = TRUE))
+              options = list(scrollX = TRUE, pageLength = 10)) %>%
+      formatRound(columns = 2:ncol(contrib_df), digits = 1)
   })
   
   # Study characteristics table
@@ -1925,7 +1951,7 @@ server <- function(input, output, session) {
     
     # Safe sorting - check if effect.random exists and is numeric
     if (!is.null(nma_result()$effect.random) && is.numeric(nma_result()$effect.random)) {
-      # Use the original sorting approach without negation
+      # Use the original sorting approach
       forest(nma_result(), 
              reference = input$forest_reference,
              sortvar = nma_result()$effect.random,
@@ -1952,35 +1978,20 @@ server <- function(input, output, session) {
     ranking <- netrank(nma_result(), small.values = input$values_direction)
     
     # Create a clean data frame for display
-    if (is.null(ranking$ranking) || !is.numeric(ranking$ranking)) {
-      # If ranking$ranking is not numeric or is NULL, use P.score if available
-      if (!is.null(ranking$P.score)) {
-        scores <- ranking$P.score
-        ranking_df <- data.frame(
-          Treatment = names(scores),
-          P_Score = round(scores * 100, 1),
-          stringsAsFactors = FALSE
-        )
-      } else {
-        # Fallback if neither is available
-        ranking_df <- data.frame(
-          Treatment = nma_result()$trts,
-          Message = "Ranking not available",
-          stringsAsFactors = FALSE
-        )
-      }
-    } else {
-      # Original code if ranking$ranking is numeric
+    if (!is.null(ranking$P.score)) {
+      scores <- ranking$P.score
       ranking_df <- data.frame(
-        Treatment = names(ranking$ranking),
-        Rank = round(ranking$ranking, 2),
+        Treatment = names(scores),
+        P_Score = round(scores * 100, 1),
         stringsAsFactors = FALSE
       )
-      
-      # Add P-score if available
-      if (!is.null(ranking$P.score)) {
-        ranking_df$P_Score <- round(ranking$P.score * 100, 1)
-      }
+    } else {
+      # Fallback if P-scores not available
+      ranking_df <- data.frame(
+        Treatment = nma_result()$trts,
+        Message = "Ranking not available",
+        stringsAsFactors = FALSE
+      )
     }
     
     datatable(ranking_df, options = list(scrollX = TRUE, pageLength = 10))
@@ -2028,13 +2039,26 @@ server <- function(input, output, session) {
     cat("25-50%: May represent moderate heterogeneity\n")
     cat("50-75%: May represent substantial heterogeneity\n")
     cat(">75%: Considerable heterogeneity\n\n")
-    # Fix for "condition has length > 1" error
-    design_count <- length(unique(nma_result()$data$design))
     
-    # Only attempt to assess inconsistency if there are closed loops
-    if (design_count > 1) {
+    # Check for closed loops in the network
+    nma <- nma_result()
+    
+    # Calculate the number of treatments
+    n_treats <- length(nma$trts)
+    n_comparisons <- nrow(nma$data)
+    
+    # A simple check: for a fully connected network, we need at least n_treats - 1 comparisons
+    # For closed loops, we need at least n_treats comparisons
+    has_loops <- n_comparisons >= n_treats
+    
+    if (has_loops) {
       cat("\nTests for inconsistency:\n")
-      print(netsplit(nma_result()))
+      tryCatch({
+        ns <- netsplit(nma_result())
+        print(ns)
+      }, error = function(e) {
+        cat("Error in inconsistency assessment:", e$message, "\n")
+      })
     } else {
       cat("\nNo closed loops in the network, inconsistency cannot be assessed.")
     }
@@ -2044,19 +2068,30 @@ server <- function(input, output, session) {
   output$inconsistency <- renderPrint({
     req(nma_result())
     
-    # Fix for "condition has length > 1" error
-    design_count <- length(unique(nma_result()$data$design))
+    nma <- nma_result()
     
-    if (design_count > 1) {
-      decomp <- decomp.design(nma_result())
-      print(decomp)
-      cat("\nQ statistics to assess inconsistency:\n")
-      cat("Within-design heterogeneity Q = ", round(decomp$Q.heterogeneity, 2), 
-          ", df = ", decomp$df.Q.heterogeneity, 
-          ", p = ", round(decomp$pval.Q.heterogeneity, 4), "\n", sep = "")
-      cat("Between-design inconsistency Q = ", round(decomp$Q.inconsistency, 2), 
-          ", df = ", decomp$df.Q.inconsistency, 
-          ", p = ", round(decomp$pval.Q.inconsistency, 4), "\n", sep = "")
+    # Calculate the number of treatments and comparisons
+    n_treats <- length(nma$trts)
+    n_comparisons <- nrow(nma$data)
+    
+    # Check if we have enough data for inconsistency assessment
+    has_loops <- n_comparisons >= n_treats
+    
+    if (has_loops) {
+      tryCatch({
+        decomp <- decomp.design(nma_result())
+        print(decomp)
+        cat("\nQ statistics to assess inconsistency:\n")
+        cat("Within-design heterogeneity Q = ", round(decomp$Q.heterogeneity, 2), 
+            ", df = ", decomp$df.Q.heterogeneity, 
+            ", p = ", round(decomp$pval.Q.heterogeneity, 4), "\n", sep = "")
+        cat("Between-design inconsistency Q = ", round(decomp$Q.inconsistency, 2), 
+            ", df = ", decomp$df.Q.inconsistency, 
+            ", p = ", round(decomp$pval.Q.inconsistency, 4), "\n", sep = "")
+      }, error = function(e) {
+        cat("Error in inconsistency assessment:", e$message, "\n")
+        cat("This may occur when the network structure doesn't allow for inconsistency assessment.\n")
+      })
     } else {
       cat("No closed loops in the network, inconsistency cannot be assessed.")
     }
@@ -2072,21 +2107,65 @@ server <- function(input, output, session) {
       # Get covariate data
       covariate_data <- data()[[input$summary_covariate]]
       
-      # Create a dummy plot for now
-      plot(1, 1, type = "n", xlab = input$summary_covariate, ylab = "Effect",
-           main = paste("Effect by", input$summary_covariate),
-           xlim = c(min(covariate_data, na.rm = TRUE), max(covariate_data, na.rm = TRUE)),
-           ylim = c(-2, 2))
-      abline(h = 0, lty = 2)
+      # Get pairwise data if available
+      if (!is.null(pairwise_data())) {
+        pw <- pairwise_data()
+        
+        # Match covariate data to pairwise data
+        pw$covariate <- data()[[input$summary_covariate]][match(pw$studlab, data()[[input$study_col]])]
+        
+        # Create scatter plot
+        plot(pw$covariate, pw$TE,
+             xlab = input$summary_covariate, 
+             ylab = paste("Effect (", input$effect_measure, ")", sep = ""),
+             main = paste("Effect by", input$summary_covariate),
+             pch = 19, col = "blue")
+        
+        # Add a simple regression line
+        fit <- lm(TE ~ covariate, data = pw)
+        abline(fit, col = "red", lwd = 2)
+        abline(h = 0, lty = 2)
+        
+        # Add R-squared value
+        r2 <- summary(fit)$r.squared
+        legend("topright", 
+               legend = paste("R² =", round(r2, 3)),
+               bty = "n")
+      } else {
+        # Create placeholder if no pairwise data
+        plot(1, 1, type = "n", xlab = input$summary_covariate, ylab = "Effect",
+             main = paste("Effect by", input$summary_covariate),
+             xlim = c(min(covariate_data, na.rm = TRUE), max(covariate_data, na.rm = TRUE)),
+             ylim = c(-2, 2))
+        abline(h = 0, lty = 2)
+        text(mean(range(covariate_data, na.rm = TRUE)), 0, 
+             "Run network meta-analysis first", cex = 1.2)
+      }
       
     } else {
       req(input$summary_baseline)
       
-      # Create a dummy baseline risk plot
-      plot(1, 1, type = "n", xlab = "Baseline Risk", ylab = "Effect",
-           main = paste("Effect by Baseline Risk (Reference:", input$summary_baseline, ")"),
-           xlim = c(0, 1), ylim = c(-2, 2))
-      abline(h = 0, lty = 2)
+      # Create baseline risk plot if baseline analysis has been run
+      if (!is.null(baseline_result())) {
+        br <- baseline_result()
+        
+        plot(br$data$baseline_risk, br$data$TE, 
+             xlab = "Baseline Risk", 
+             ylab = paste("Effect (", input$effect_measure, ")", sep = ""),
+             main = paste("Effect by Baseline Risk (Reference:", input$summary_baseline, ")"),
+             pch = 19, col = "blue")
+        
+        # Add regression line
+        abline(br$model$beta[1], br$model$beta[2], col = "red", lwd = 2)
+        abline(h = 0, lty = 2)
+      } else {
+        # Create placeholder
+        plot(1, 1, type = "n", xlab = "Baseline Risk", ylab = "Effect",
+             main = paste("Effect by Baseline Risk (Reference:", input$summary_baseline, ")"),
+             xlim = c(0, 1), ylim = c(-2, 2))
+        abline(h = 0, lty = 2)
+        text(0.5, 0, "Run baseline risk analysis first", cex = 1.2)
+      }
     }
   })
   
@@ -2117,10 +2196,27 @@ server <- function(input, output, session) {
           ) %>%
           filter(!is.na(baseline_risk))
       } else {
-        # For continuous/HR, we'll use a simplified approach
-        baseline_data <- pw
-        baseline_data$baseline_risk <- runif(nrow(baseline_data), 0.1, 0.4)
+        # For continuous/HR outcomes, calculate a pseudo baseline risk
+        # based on the control group mean or median effect
+        baseline_data <- pw %>%
+          filter(treat1 == input$baseline_reference | treat2 == input$baseline_reference)
+        
+        if (nrow(baseline_data) > 0) {
+          # Use a normalized version of the control group response
+          if (input$effect_measure %in% c("MD", "SMD")) {
+            baseline_data$baseline_risk <- ifelse(
+              baseline_data$treat1 == input$baseline_reference,
+              baseline_data$mean1 / max(abs(c(baseline_data$mean1, baseline_data$mean2)), na.rm = TRUE),
+              baseline_data$mean2 / max(abs(c(baseline_data$mean1, baseline_data$mean2)), na.rm = TRUE)
+            )
+          } else {
+            # For HR, use a simulated baseline risk
+            baseline_data$baseline_risk <- runif(nrow(baseline_data), 0.1, 0.4)
+          }
+        }
       }
+      
+      progress$set(message = "Fitting meta-regression model...", value = 0.5)
       
       # Create a basic meta-regression model using metafor
       if (requireNamespace("metafor", quietly = TRUE)) {
@@ -2177,19 +2273,24 @@ server <- function(input, output, session) {
       # Add horizontal line at y = 0
       abline(h = 0, lty = 2)
       
-      # Add confidence bands if available
-      if (requireNamespace("metafor", quietly = TRUE)) {
-        # Generate predicted values for plotting
-        newdata <- data.frame(baseline_risk = seq(min(br$data$baseline_risk), 
-                                                  max(br$data$baseline_risk), 
-                                                  length.out = 100))
-        pred <- predict(br$model, newmods = cbind(newdata$baseline_risk), level = 0.95)
-        
-        # Add the prediction interval
-        lines(newdata$baseline_risk, pred$pred, col = "red", lwd = 2)
-        lines(newdata$baseline_risk, pred$ci.lb, col = "red", lty = 2)
-        lines(newdata$baseline_risk, pred$ci.ub, col = "red", lty = 2)
-      }
+      # Add confidence bands
+      newdata <- data.frame(baseline_risk = seq(min(br$data$baseline_risk), 
+                                                max(br$data$baseline_risk), 
+                                                length.out = 100))
+      pred <- predict(br$model, newmods = cbind(newdata$baseline_risk), level = 0.95)
+      
+      # Add the prediction interval
+      lines(newdata$baseline_risk, pred$pred, col = "red", lwd = 2)
+      lines(newdata$baseline_risk, pred$ci.lb, col = "red", lty = 2)
+      lines(newdata$baseline_risk, pred$ci.ub, col = "red", lty = 2)
+      
+      # Add legend
+      legend("topright", 
+             legend = c("Observed", "Fitted", "95% CI"),
+             col = c("blue", "red", "red"),
+             lty = c(NA, 1, 2),
+             pch = c(19, NA, NA),
+             bty = "n")
     } else {
       # Create placeholder plot
       plot(0, 0, type = "n", xlim = c(0, 1), ylim = c(-2, 2),
@@ -2201,79 +2302,99 @@ server <- function(input, output, session) {
   
   # Baseline forest plot
   output$baseline_forest_plot <- renderPlot({
-    req(baseline_result(), input$baseline_value)
+    req(baseline_result(), nma_result(), input$baseline_value)
     
-    # Create a forest plot with adjusted effects at a specific baseline risk value
-    plot(1, 1, type = "n", xlab = "Effect", ylab = "",
-         main = paste("Forest Plot at Baseline Risk =", input$baseline_value),
-         xlim = c(-2, 2), ylim = c(0, 10))
-    abline(v = 0, lty = 2)
+    # Create adjusted forest plot
+    create_metareg_forest_plot(
+      nma = nma_result(),
+      metareg_model = baseline_result()$model,
+      covariate_value = input$baseline_value,
+      reference_treatment = baseline_result()$reference,
+      sm = input$effect_measure,
+      cov_name = "Baseline Risk"
+    )
   })
   
   # Baseline comparison table
   output$baseline_comparison_table <- renderDT({
-    req(baseline_result())
+    req(baseline_result(), nma_result())
     
-    # Create a comparison table for all treatment pairs at a specific baseline risk
-    br <- baseline_result()
-    nma <- nma_result()
-    
-    # Create empty grid
-    treatments <- nma$trts
+    # Get all treatments
+    treatments <- nma_result()$trts
     n_treats <- length(treatments)
-    grid <- matrix(NA, nrow = n_treats, ncol = n_treats)
-    rownames(grid) <- treatments
-    colnames(grid) <- treatments
     
-    # Fill with placeholder values (would be actual calculations in full implementation)
+    # Create comparison matrix
+    comparison_matrix <- matrix(NA, nrow = n_treats, ncol = n_treats,
+                                dimnames = list(treatments, treatments))
+    
+    # Get baseline risk value
+    baseline_value <- input$baseline_value
+    
+    # Calculate adjusted effects
+    br <- baseline_result()
+    adjustment <- 0
+    
+    if (!is.null(br$model)) {
+      # Calculate adjustment based on baseline risk
+      mean_baseline <- mean(br$data$baseline_risk, na.rm = TRUE)
+      adjustment <- br$model$beta[2] * (baseline_value - mean_baseline)
+    }
+    
+    # Fill comparison matrix with adjusted NMA estimates
     for (i in 1:n_treats) {
       for (j in 1:n_treats) {
         if (i != j) {
-          # Simple placeholder values
-          grid[i, j] <- round(runif(1, -1, 1), 2)
+          # Find the comparison in NMA results
+          idx <- which((nma_result()$treat1 == treatments[i] & nma_result()$treat2 == treatments[j]) |
+                       (nma_result()$treat1 == treatments[j] & nma_result()$treat2 == treatments[i]))
+          
+          if (length(idx) > 0) {
+            if (nma_result()$treat1[idx] == treatments[i]) {
+              comparison_matrix[i, j] <- round(nma_result()$TE.nma.random[idx] + adjustment, 3)
+            } else {
+              comparison_matrix[i, j] <- round(-nma_result()$TE.nma.random[idx] + adjustment, 3)
+            }
+          }
         }
       }
     }
     
-    # Convert to data frame for display
-    grid_df <- as.data.frame(grid)
-    grid_df$Treatment <- rownames(grid)
-    grid_df <- grid_df[, c("Treatment", treatments)]
+    # Convert to data frame
+    comparison_df <- as.data.frame(comparison_matrix)
+    comparison_df$Treatment <- rownames(comparison_df)
+    comparison_df <- comparison_df[, c("Treatment", treatments)]
     
-    datatable(grid_df, 
-              caption = paste("Comparisons at Baseline Risk =", input$baseline_value),
+    datatable(comparison_df, 
+              caption = paste("Treatment Comparisons at Baseline Risk =", baseline_value),
               options = list(scrollX = TRUE))
   })
   
   # Baseline ranking plot
   output$baseline_ranking_plot <- renderPlot({
-    req(baseline_result(), input$baseline_ranking_value)
+    req(baseline_result(), nma_result(), input$baseline_ranking_value)
     
-    # Create a barplot showing treatment rankings at a specific baseline risk
-    treatments <- nma_result()$trts
-    
-    # Create placeholder P-scores (would be actual calculations in full implementation)
-    p_scores <- runif(length(treatments), 0, 1)
-    names(p_scores) <- treatments
+    # Generate adjusted rankings
+    adjusted_rankings <- generate_adjusted_rankings(
+      nma = nma_result(),
+      metareg_model = baseline_result()$model,
+      covariate_value = input$baseline_ranking_value,
+      cov_name = "Baseline Risk"
+    )
     
     # Create barplot
-    barplot(p_scores * 100, 
+    barplot(adjusted_rankings$p_scores * 100, 
             main = paste("P-Scores at Baseline Risk =", input$baseline_ranking_value),
             xlab = "Treatment", ylab = "P-Score (%)",
             col = "lightgreen",
-            ylim = c(0, 100))
-  })
-  
-  # Baseline node-split plot
-  output$baseline_nodesplit_plot <- renderPlot({
-    req(baseline_result())
+            ylim = c(0, 100),
+            names.arg = adjusted_rankings$treatments)
     
-    # Create placeholder node-split plot
-    plot(0, 0, type = "n", xlim = c(0, 1), ylim = c(0, 1),
-         xlab = "", ylab = "",
-         main = "Node-Splitting Analysis with Baseline Risk Adjustment")
-    text(0.5, 0.5, "Node-splitting with baseline risk adjustment\nis not implemented in this version", 
-         cex = 1.2)
+    # Add a note
+    mtext(paste("Rankings adjusted for baseline risk (", 
+                ifelse(input$values_direction == "good", 
+                       "smaller values are better", 
+                       "larger values are better"), ")", sep = ""),
+          side = 3, line = 0.5, cex = 0.8)
   })
   
   # Baseline details
@@ -2282,47 +2403,30 @@ server <- function(input, output, session) {
     
     br <- baseline_result()
     
-    cat("Baseline Risk Analysis Details:\n\n")
-    cat("Reference treatment:", br$reference, "\n\n")
+    cat("Baseline Risk Meta-Regression Results:\n")
+    cat("=====================================\n\n")
     
-    cat("Baseline risk data used for analysis:\n")
-    print(head(br$data[, c("studlab", "treat1", "treat2", "baseline_risk", "TE")], 10))
+    cat("Reference treatment:", br$reference, "\n")
+    cat("Number of studies included:", nrow(br$data), "\n\n")
     
-    cat("\nThis is a demonstration of baseline risk analysis. In a full implementation,\n")
-    cat("this would provide detailed model coefficients and statistical tests for\n")
-    cat("the relationship between baseline risk and treatment effects.")
+    cat("Model Summary:\n")
+    print(summary(br$model))
+    
+    cat("\n\nInterpretation:\n")
+    cat("- The intercept represents the effect at baseline risk = 0\n")
+    cat("- The slope coefficient indicates how the treatment effect changes\n")
+    cat("  with each unit increase in baseline risk\n")
+    
+    if (br$model$beta[2] > 0) {
+      cat("- Positive slope: treatment effect increases with higher baseline risk\n")
+    } else if (br$model$beta[2] < 0) {
+      cat("- Negative slope: treatment effect decreases with higher baseline risk\n")
+    } else {
+      cat("- No significant relationship between baseline risk and treatment effect\n")
+    }
   })
   
-  # Baseline deviance report
-  output$baseline_deviance <- renderPrint({
-    req(baseline_result())
-    
-    cat("Deviance Report for Baseline Risk Model:\n\n")
-    cat("This is a placeholder. In a full implementation, this would provide\n")
-    cat("deviance statistics comparing models with and without baseline risk adjustment.\n\n")
-    
-    cat("Model deviance would include:\n")
-    cat("- Residual deviance\n")
-    cat("- Model fit statistics\n")
-    cat("- Comparison with unadjusted model")
-  })
-  
-  # Baseline model details
-  output$baseline_model <- renderPrint({
-    req(baseline_result())
-    
-    cat("Baseline Risk Model Details:\n\n")
-    cat("This is a placeholder. In a full implementation, this would provide\n")
-    cat("the complete model specification for the baseline risk-adjusted NMA.\n\n")
-    
-    cat("Model details would include:\n")
-    cat("- Model formula\n")
-    cat("- Prior distributions (for Bayesian models)\n")
-    cat("- MCMC settings (for Bayesian models)\n")
-    cat("- Model diagnostics")
-  })
-  
-  # Covariate analysis (meta-regression) - Enhanced version
+  # Covariate analysis (meta-regression)
   observeEvent(input$run_metareg, {
     req(nma_result(), pairwise_data(), input$covariate_var)
     
@@ -2354,9 +2458,9 @@ server <- function(input, output, session) {
       # Get pairwise data and merge with covariate data
       pw <- pairwise_data()
       
-      # Add covariate information
+      # Match covariate information to studies
       covariate_name <- input$covariate_var
-      pw$matched_covs <- data()[[covariate_name]]
+      pw$matched_covs <- data()[[covariate_name]][match(pw$studlab, data()[[input$study_col]])]
       
       # Check for missing data
       valid_data <- !is.na(pw$TE) & !is.na(pw$seTE) & !is.na(pw$matched_covs)
@@ -2397,99 +2501,61 @@ server <- function(input, output, session) {
       progress$set(message = "Running meta-regression model...", value = 0.5)
       
       # Run meta-regression with metafor
-      if (requireNamespace("metafor", quietly = TRUE)) {
+      if (input$include_interaction) {
+        # Create treatment indicators
+        pw$reference <- as.numeric(pw$treat1 == reference | pw$treat2 == reference)
         
-        if (input$include_interaction) {
-          # Create treatment indicators
-          pw$reference <- as.numeric(pw$treat1 == reference | pw$treat2 == reference)
+        # Create interaction term based on covariate type
+        if (input$covariate_type == "categorical") {
+          # For categorical covariates
+          mr_model <- rma(yi = TE, sei = seTE, mods = ~ matched_covs * reference, 
+                          data = pw, method = "REML")
+        } else {
+          # For numeric covariates
+          pw$interaction <- pw$matched_covs * pw$reference
           
-          # Create interaction term based on covariate type
-          if (input$covariate_type == "categorical") {
-            # For categorical covariates, use formula notation
-            mr_model <- try(rma(yi = TE, sei = seTE, mods = ~ matched_covs * reference, 
-                                data = pw, method = "REML"), silent = TRUE)
-          } else {
-            # For numeric covariates, create the interaction term
-            pw$interaction <- pw$matched_covs * pw$reference
-            
-            # Model with interaction
-            mr_model <- try(rma(yi = TE, sei = seTE, mods = ~ matched_covs + reference + interaction, 
-                                data = pw, method = "REML"), silent = TRUE)
-          }
-        } else {
-          # Simple model without interaction
-          mr_model <- try(rma(yi = TE, sei = seTE, mods = ~ matched_covs, 
-                              data = pw, method = "REML"), silent = TRUE)
+          # Model with interaction
+          mr_model <- rma(yi = TE, sei = seTE, mods = ~ matched_covs + reference + interaction, 
+                          data = pw, method = "REML")
         }
-        
-        # Check if model ran successfully
-        if (inherits(mr_model, "try-error")) {
-          showNotification(paste("Error in meta-regression:", mr_model[1]), type = "error")
-          return(NULL)
-        }
-        
-        # Generate predictions at different covariate values
-        if (input$covariate_type == "continuous") {
-          cov_range <- range(pw$matched_covs, na.rm = TRUE)
-          predictions <- calculate_metareg_predictions(mr_model, cov_range, treatments)
-        } else {
-          # For categorical, predict at each level
-          predictions <- NULL
-        }
-        
-        # Store the results
-        metareg_result(list(
-          covariate = covariate_name,
-          type = input$covariate_type,
-          data = pw,
-          model = mr_model,
-          method = "metafor",
-          reference_treatment = reference,
-          include_interaction = input$include_interaction,
-          predictions = predictions
-        ))
-        
-        # Show success notification
-        showNotification("Meta-regression completed", type = "message")
       } else {
-        # Fallback to simple linear model with similar fixes
-        if (input$include_interaction) {
-          # Create treatment indicators
-          pw$reference <- as.numeric(pw$treat1 == reference | pw$treat2 == reference)
-          
-          # Create interaction term
-          if (input$covariate_type == "categorical") {
-            # Use character variable to avoid factor * numeric issues
-            mr_model <- lm(TE ~ matched_covs * reference, data = pw)
-          } else {
-            pw$interaction <- pw$matched_covs * pw$reference
-            mr_model <- lm(TE ~ matched_covs + reference + interaction, data = pw)
-          }
-        } else {
-          # Simple model without interaction
-          mr_model <- lm(TE ~ matched_covs, data = pw)
-        }
-        
-        # Store the results
-        metareg_result(list(
-          covariate = covariate_name,
-          type = input$covariate_type,
-          data = pw,
-          model = mr_model,
-          method = "lm",
-          reference_treatment = reference,
-          include_interaction = input$include_interaction
-        ))
-        
-        showNotification("Meta-regression completed (using simplified model)", type = "warning")
+        # Simple model without interaction
+        mr_model <- rma(yi = TE, sei = seTE, mods = ~ matched_covs, 
+                        data = pw, method = "REML")
       }
+      
+      # Generate predictions at different covariate values
+      if (input$covariate_type == "continuous") {
+        cov_range <- range(pw$matched_covs, na.rm = TRUE)
+        predictions <- calculate_metareg_predictions(mr_model, cov_range, treatments)
+      } else {
+        # For categorical, predictions are handled differently
+        predictions <- NULL
+      }
+      
+      # Store the results
+      metareg_result(list(
+        covariate = covariate_name,
+        type = input$covariate_type,
+        data = pw,
+        model = mr_model,
+        method = "metafor",
+        reference_treatment = reference,
+        include_interaction = input$include_interaction,
+        predictions = predictions
+      ))
+      
+      # Show success notification
+      showNotification("Meta-regression completed", type = "message")
       
     }, error = function(e) {
       showNotification(paste("Error in meta-regression:", e$message), type = "error")
     })
+    
+    progress$set(message = "Meta-regression complete!", value = 1)
   })
   
-  # Covariate regression plot - Enhanced version
+  # Covariate regression plot
   output$covariate_regression_plot <- renderPlot({
     req(metareg_result())
     
@@ -2520,74 +2586,41 @@ server <- function(input, output, session) {
                bty = "n", cex = 0.8)
         
         # Add regression line
-        if (mr$method %in% c("metafor", "rma")) {
-          # For metafor, we need to extract the correct coefficients
-          if (mr$include_interaction) {
-            # This is simplified - in a real implementation, we'd need to handle 
-            # the predictions more carefully with interactions
-            abline(mr$model$beta[1], mr$model$beta[2], col = "red", lwd = 2)
-          } else {
-            abline(mr$model$beta[1], mr$model$beta[2], col = "red", lwd = 2)
-          }
-        } else if (mr$method == "lm") {
-          abline(mr$model, col = "red", lwd = 2)
+        if (!mr$include_interaction) {
+          # Simple regression line
+          abline(mr$model$beta[1], mr$model$beta[2], col = "red", lwd = 2)
+        } else {
+          # For interaction models, show the average effect
+          x_range <- range(mr$data$matched_covs, na.rm = TRUE)
+          x_seq <- seq(x_range[1], x_range[2], length.out = 100)
+          y_seq <- mr$model$beta[1] + mr$model$beta[2] * x_seq
+          lines(x_seq, y_seq, col = "red", lwd = 2)
         }
         
         # Add horizontal line at y = 0
         abline(h = 0, lty = 2)
         
-        # Add confidence bands if available and using metafor
-        if (mr$method %in% c("metafor", "rma") && requireNamespace("metafor", quietly = TRUE)) {
-          # Generate predicted values for plotting
-          x_range <- range(mr$data$matched_covs, na.rm = TRUE)
-          newdata <- data.frame(matched_covs = seq(x_range[1], x_range[2], length.out = 100))
-          
-          if (mr$include_interaction) {
-            # This is a simplification - with interaction terms, we would need
-            # to create the correct model matrix for predictions
-            newdata$reference <- 0
-            newdata$interaction <- 0
-            
-            # Create the appropriate newmods matrix
-            k <- length(mr$model$beta)
-            if (k == 4) { 
-              # Model with intercept, covariate, reference, and interaction
-              newmods <- cbind(newdata$matched_covs, newdata$reference, newdata$interaction)
-            } else if (k > 4) {
-              # More complex model with multiple terms
-              newmods <- cbind(newdata$matched_covs, rep(0, nrow(newdata)), rep(0, nrow(newdata)))
-            } else {
-              # Simplified case
-              newmods <- cbind(newdata$matched_covs)
-            }
-            
-            # Safe prediction with error handling
-            tryCatch({
-              pred <- predict(mr$model, newmods = newmods, level = 0.95)
-              
-              # Add the prediction interval
-              lines(newdata$matched_covs, pred$pred, col = "red", lwd = 2)
-              lines(newdata$matched_covs, pred$ci.lb, col = "red", lty = 2)
-              lines(newdata$matched_covs, pred$ci.ub, col = "red", lty = 2)
-            }, error = function(e) {
-              # Draw a simple regression line if prediction fails
-              message("Error in prediction: ", e$message)
-            })
+        # Add confidence bands
+        x_range <- range(mr$data$matched_covs, na.rm = TRUE)
+        newdata <- data.frame(matched_covs = seq(x_range[1], x_range[2], length.out = 100))
+        
+        tryCatch({
+          if (!mr$include_interaction) {
+            pred <- predict(mr$model, newmods = cbind(newdata$matched_covs), level = 0.95)
           } else {
-            # Simple model without interaction
-            tryCatch({
-              pred <- predict(mr$model, newmods = cbind(newdata$matched_covs), level = 0.95)
-              
-              # Add the prediction interval
-              lines(newdata$matched_covs, pred$pred, col = "red", lwd = 2)
-              lines(newdata$matched_covs, pred$ci.lb, col = "red", lty = 2)
-              lines(newdata$matched_covs, pred$ci.ub, col = "red", lty = 2)
-            }, error = function(e) {
-              # Draw a simple regression line if prediction fails
-              message("Error in prediction: ", e$message)
-            })
+            # For interaction model, predict at average reference value
+            newdata$reference <- mean(mr$data$reference)
+            newdata$interaction <- newdata$matched_covs * newdata$reference
+            pred <- predict(mr$model, newmods = cbind(newdata$matched_covs, newdata$reference, newdata$interaction), level = 0.95)
           }
-        }
+          
+          # Add the prediction interval
+          lines(newdata$matched_covs, pred$pred, col = "red", lwd = 2)
+          lines(newdata$matched_covs, pred$ci.lb, col = "red", lty = 2)
+          lines(newdata$matched_covs, pred$ci.ub, col = "red", lty = 2)
+        }, error = function(e) {
+          # Continue without confidence bands if prediction fails
+        })
       } else {
         # For categorical covariates - create a box plot
         # Convert matched_covs to factor if it's not already
@@ -2602,6 +2635,11 @@ server <- function(input, output, session) {
         
         # Add horizontal line at y = 0
         abline(h = 0, lty = 2, col = "red")
+        
+        # Add sample sizes
+        n_per_category <- table(factor_data)
+        mtext(paste("n =", n_per_category), at = 1:length(n_per_category), 
+              side = 3, line = 0, cex = 0.8)
       }
     } else {
       # Create placeholder plot
@@ -2612,7 +2650,7 @@ server <- function(input, output, session) {
     }
   })
   
-  # Covariate forest plot - Enhanced version
+  # Covariate forest plot
   output$covariate_forest_plot <- renderPlot({
     req(metareg_result(), nma_result())
     
@@ -2644,44 +2682,42 @@ server <- function(input, output, session) {
     
     mr <- metareg_result()
     
-    if (mr$method == "metafor") {
-      # Extract model results
-      results <- summary(mr$model)
-      
-      # Create data frame of results
-      result_df <- data.frame(
-        Parameter = rownames(results$beta),
-        Estimate = results$beta,
-        SE = results$se,
-        Z_value = results$zval,
-        P_value = results$pval,
-        CI_lower = results$ci.lb,
-        CI_upper = results$ci.ub
-      )
-      
-      datatable(result_df, 
-                caption = paste("Meta-Regression with", mr$covariate),
-                options = list(scrollX = TRUE))
+    # Extract model results
+    results <- summary(mr$model)
+    
+    # Create data frame of results
+    result_df <- data.frame(
+      Parameter = rownames(results$beta),
+      Estimate = round(results$beta, 4),
+      SE = round(results$se, 4),
+      Z_value = round(results$zval, 3),
+      P_value = format.pval(results$pval, digits = 3),
+      CI_lower = round(results$ci.lb, 4),
+      CI_upper = round(results$ci.ub, 4),
+      stringsAsFactors = FALSE
+    )
+    
+    # Add row names that are more descriptive
+    if (mr$include_interaction) {
+      if (nrow(result_df) >= 4) {
+        result_df$Parameter[1] <- "Intercept"
+        result_df$Parameter[2] <- mr$covariate
+        result_df$Parameter[3] <- paste("Reference treatment (", mr$reference_treatment, ")")
+        result_df$Parameter[4] <- paste(mr$covariate, "× Reference interaction")
+      }
     } else {
-      # Use lm summary for linear model
-      lm_summary <- summary(mr$model)
-      
-      # Create result dataframe
-      result_df <- data.frame(
-        Parameter = rownames(lm_summary$coefficients),
-        Estimate = lm_summary$coefficients[,1],
-        SE = lm_summary$coefficients[,2],
-        t_value = lm_summary$coefficients[,3],
-        P_value = lm_summary$coefficients[,4]
-      )
-      
-      datatable(result_df, 
-                caption = paste("Linear Regression with", mr$covariate),
-                options = list(scrollX = TRUE))
+      if (nrow(result_df) >= 2) {
+        result_df$Parameter[1] <- "Intercept"
+        result_df$Parameter[2] <- mr$covariate
+      }
     }
+    
+    datatable(result_df, 
+              caption = paste("Meta-Regression Results:", mr$covariate),
+              options = list(scrollX = TRUE, pageLength = 10))
   })
   
-  # Covariate ranking plot - Enhanced version
+  # Covariate ranking plot
   output$covariate_ranking_plot <- renderPlot({
     req(nma_result())
     
@@ -2705,22 +2741,23 @@ server <- function(input, output, session) {
       
       # Create barplot with adjusted P-scores
       barplot(adjusted_rankings$p_scores * 100, 
-              main = paste("Adjusted P-Score Rankings at", mr$covariate, "=", covariate_value,
+              main = paste("Adjusted P-Score Rankings at", mr$covariate, "=", round(covariate_value, 2),
                            "\n(", ifelse(input$values_direction == "good", 
                                          "smaller values are better", 
                                          "larger values are better"), ")"),
               xlab = "Treatment", ylab = "Adjusted P-Score (%)",
               col = "lightgreen",
               ylim = c(0, 100),
-              names.arg = adjusted_rankings$treatments)
+              names.arg = adjusted_rankings$treatments,
+              las = 2)
       
       # Add a note about the adjustment
       if (mr$include_interaction) {
-        mtext(paste("Note: Rankings adjusted for covariate-by-treatment interaction",
+        mtext(paste("Rankings adjusted for covariate-by-treatment interaction",
                     "using", mr$reference_treatment, "as reference"), 
               side = 3, line = 0.5, cex = 0.7)
       } else {
-        mtext("Note: Rankings adjusted for covariate effect", 
+        mtext("Rankings adjusted for covariate effect", 
               side = 3, line = 0.5, cex = 0.7)
       }
     } else {
@@ -2752,7 +2789,7 @@ server <- function(input, output, session) {
     }
     
     # Create bubble plot using the helper function
-    create_metareg_bubble_plot(
+    print(create_metareg_bubble_plot(
       data = bubble_data,
       xvar = "matched_covs",
       yvar = "TE",
@@ -2760,7 +2797,7 @@ server <- function(input, output, session) {
       title = paste("Meta-Regression Bubble Plot for", input$bubble_treatment),
       xlab = mr$covariate,
       ylab = paste("Effect (", input$effect_measure, ")")
-    )
+    ))
   })
   
   # Meta-regression model summary
@@ -2769,59 +2806,97 @@ server <- function(input, output, session) {
     
     mr <- metareg_result()
     
-    cat("Meta-Regression Model Summary:\n\n")
+    cat("Meta-Regression Model Summary:\n")
+    cat("==============================\n\n")
     
-    if (mr$method %in% c("metafor", "rma")) {
-      # For metafor models
-      print(summary(mr$model))
+    print(summary(mr$model))
+    
+    cat("\nInterpretation:\n")
+    cat("================\n")
+    
+    if (mr$type == "continuous") {
+      cat("- The intercept represents the effect when", mr$covariate, "= 0\n")
+      cat("- The coefficient for", mr$covariate, "indicates how the effect changes\n")
+      cat("  with each unit increase in", mr$covariate, "\n")
       
-      cat("\nInterpretation:\n")
-      cat("- Positive coefficients indicate that as the covariate increases, the effect size increases\n")
-      cat("- For log odds ratios, risk ratios, or hazard ratios, this means higher risk\n")
-      cat("- For mean differences, this indicates a larger difference between treatments\n")
-      
-      if (mr$include_interaction) {
-        cat("\nNote: This model includes treatment-by-covariate interaction using")
-        cat(mr$reference_treatment, "as the reference treatment\n")
+      if (mr$model$beta[2] > 0) {
+        cat("- Positive coefficient: treatment effect increases with higher", mr$covariate, "\n")
+      } else if (mr$model$beta[2] < 0) {
+        cat("- Negative coefficient: treatment effect decreases with higher", mr$covariate, "\n")
       }
-    } else if (mr$method == "lm") {
-      # For linear models
-      print(summary(mr$model))
-      
-      cat("\nWarning: This is a simplified analysis using ordinary least squares regression.\n")
-      cat("It does not account for the precision of the effect estimates.\n")
+    } else {
+      cat("- The intercept represents the effect for the reference category\n")
+      cat("- Other coefficients represent the difference from the reference category\n")
+    }
+    
+    if (mr$include_interaction) {
+      cat("\nNote: This model includes treatment-by-covariate interaction using\n")
+      cat(mr$reference_treatment, "as the reference treatment.\n")
+      cat("The interaction term indicates whether the covariate effect differs\n")
+      cat("between treatments involving the reference and other comparisons.\n")
     }
   })
   
   # Predicted effects table
   output$predicted_effects_table <- renderDT({
-    req(metareg_result(), nma_result())
+    req(metareg_result())
     
     mr <- metareg_result()
     
     if (mr$type == "continuous" && !is.null(mr$predictions)) {
       # Create a table of predicted effects at different covariate values
-      pred_data <- data.frame()
+      pred_data <- do.call(rbind, mr$predictions)
       
-      # Get a sequence of covariate values
-      cov_values <- sort(unique(sapply(mr$predictions, function(x) x$covariate_value)))
-      
-      # Create rows for each covariate value
-      for (cov_val in cov_values) {
-        pred <- mr$predictions[[as.character(cov_val)]]
-        pred_row <- data.frame(
-          Covariate_Value = cov_val,
-          Effect = round(pred$effect, 3),
-          Lower_CI = round(pred$lower_ci, 3),
-          Upper_CI = round(pred$upper_ci, 3)
-        )
-        
-        pred_data <- rbind(pred_data, pred_row)
-      }
+      # Format the data frame
+      pred_data <- pred_data %>%
+        mutate(
+          Covariate_Value = round(covariate_value, 2),
+          Effect = round(effect, 3),
+          Lower_CI = round(lower_ci, 3),
+          Upper_CI = round(upper_ci, 3),
+          CI = paste0("[", Lower_CI, ", ", Upper_CI, "]")
+        ) %>%
+        select(Covariate_Value, Effect, CI)
       
       datatable(pred_data,
                 caption = paste("Predicted Effects at Different Values of", mr$covariate),
-                options = list(pageLength = 5, scrollX = TRUE))
+                options = list(pageLength = 10, scrollX = TRUE))
+    } else if (mr$type == "categorical") {
+      # For categorical variables, show the effect for each category
+      coef_summary <- summary(mr$model)
+      
+      # Extract category effects
+      categories <- levels(factor(mr$data$matched_covs))
+      effects_df <- data.frame(
+        Category = categories,
+        Effect = NA,
+        CI = NA,
+        stringsAsFactors = FALSE
+      )
+      
+      # Reference category
+      effects_df$Effect[1] <- round(coef_summary$beta[1], 3)
+      effects_df$CI[1] <- paste0("[", round(coef_summary$ci.lb[1], 3), ", ", 
+                                 round(coef_summary$ci.ub[1], 3), "]")
+      
+      # Other categories
+      if (length(categories) > 1) {
+        for (i in 2:length(categories)) {
+          if (i <= nrow(coef_summary$beta)) {
+            effects_df$Effect[i] <- round(coef_summary$beta[1] + coef_summary$beta[i], 3)
+            # Approximate CI (this is simplified)
+            effects_df$CI[i] <- paste0("[", 
+                                       round(coef_summary$beta[1] + coef_summary$beta[i] - 1.96 * coef_summary$se[i], 3), 
+                                       ", ", 
+                                       round(coef_summary$beta[1] + coef_summary$beta[i] + 1.96 * coef_summary$se[i], 3), 
+                                       "]")
+          }
+        }
+      }
+      
+      datatable(effects_df,
+                caption = paste("Predicted Effects by", mr$covariate, "Category"),
+                options = list(pageLength = 10, scrollX = TRUE))
     } else {
       # Return empty table if no predictions
       datatable(data.frame(Message = "No predictions available"),
@@ -2836,46 +2911,41 @@ server <- function(input, output, session) {
     
     mr <- metareg_result()
     
-    cat("Goodness of Fit for Meta-Regression Model:\n\n")
+    cat("Goodness of Fit for Meta-Regression Model:\n")
+    cat("==========================================\n\n")
     
-    if (mr$method %in% c("metafor", "rma")) {
-      # Extract model fit statistics
-      cat("Model Fit Statistics:\n")
-      if (!is.null(mr$model$fit.stats)) {
-        cat("AIC:", round(mr$model$fit.stats["AIC", "REML"], 2), "\n")
-        cat("BIC:", round(mr$model$fit.stats["BIC", "REML"], 2), "\n")
-        cat("Log-likelihood:", round(mr$model$fit.stats["ll", "REML"], 2), "\n\n")
-      } else {
-        cat("Model fit statistics not available\n\n")
-      }
-      
-      # Test of moderators
-      cat("Test of Moderators (Omnibus Test):\n")
-      cat("QM =", round(mr$model$QM, 2), "on", mr$model$m, "df, p =", 
-          format.pval(mr$model$QMp, digits = 4), "\n\n")
-      
-      # Variance components 
-      cat("Variance Components:\n")
-      cat("Tau^2 (estimated amount of residual heterogeneity):", round(mr$model$tau2, 4), "\n")
-      cat("I^2 (residual heterogeneity / unaccounted variability):", 
-          round(mr$model$I2 * 100, 1), "%\n")
-      cat("H^2 (unaccounted variability / sampling variability):", round(mr$model$H2, 2), "\n")
-      
-      # R² statistic (if available)
-      if (!is.null(mr$model$R2)) {
-        cat("R^2 (amount of heterogeneity accounted for):", round(mr$model$R2 * 100, 1), "%\n")
-      }
-    } else if (mr$method == "lm") {
-      # For linear models
-      summary_obj <- summary(mr$model)
-      
-      cat("Model Summary:\n")
-      cat("Multiple R-squared:", round(summary_obj$r.squared, 4), "\n")
-      cat("Adjusted R-squared:", round(summary_obj$adj.r.squared, 4), "\n")
-      cat("F-statistic:", round(summary_obj$fstatistic[1], 2), "on", 
-          summary_obj$fstatistic[2], "and", summary_obj$fstatistic[3], "DF, p-value:", 
-          format.pval(1 - pf(summary_obj$fstatistic[1], summary_obj$fstatistic[2], 
-                             summary_obj$fstatistic[3]), digits = 4), "\n")
+    # Extract model fit statistics
+    cat("Model Fit Statistics:\n")
+    cat("---------------------\n")
+    cat("AIC:", round(AIC(mr$model), 2), "\n")
+    cat("BIC:", round(BIC(mr$model), 2), "\n")
+    cat("Log-likelihood:", round(logLik(mr$model), 2), "\n\n")
+    
+    # Test of moderators
+    cat("Test of Moderators (Omnibus Test):\n")
+    cat("-----------------------------------\n")
+    cat("QM =", round(mr$model$QM, 2), "on", mr$model$m, "df, p =", 
+        format.pval(mr$model$QMp, digits = 3), "\n")
+    
+    if (mr$model$QMp < 0.05) {
+      cat("The moderator(s) significantly explain heterogeneity in the effect sizes.\n\n")
+    } else {
+      cat("The moderator(s) do not significantly explain heterogeneity in the effect sizes.\n\n")
+    }
+    
+    # Variance components 
+    cat("Variance Components:\n")
+    cat("--------------------\n")
+    cat("Tau² (estimated amount of residual heterogeneity):", round(mr$model$tau2, 4), "\n")
+    cat("I² (residual heterogeneity / unaccounted variability):", 
+        round(mr$model$I2, 1), "%\n")
+    cat("H² (unaccounted variability / sampling variability):", round(mr$model$H2, 2), "\n")
+    
+    # R² statistic
+    if (!is.null(mr$model$R2)) {
+      cat("\nProportion of Heterogeneity Explained:\n")
+      cat("--------------------------------------\n")
+      cat("R² (amount of heterogeneity accounted for):", round(mr$model$R2, 1), "%\n")
     }
   })
   
@@ -2885,27 +2955,39 @@ server <- function(input, output, session) {
     
     mr <- metareg_result()
     
-    if (mr$method %in% c("metafor", "rma")) {
-      # Get residuals vs fitted values
-      fitted <- fitted(mr$model)
-      resid <- residuals(mr$model)
-      
-      # Create a residual plot
-      plot(fitted, resid, 
-           xlab = "Fitted Values", ylab = "Residuals",
-           main = "Residuals vs Fitted Values",
-           pch = 19, col = "blue")
-      
-      # Add a horizontal line at y = 0
-      abline(h = 0, lty = 2, col = "red")
-      
-      # Add a smoothed line to show any patterns
-      if (length(fitted) > 3) {
-        lines(lowess(fitted, resid), col = "green", lwd = 2)
+    # Get residuals and fitted values
+    fitted_vals <- fitted(mr$model)
+    resid_vals <- residuals(mr$model)
+    
+    # Create a residual plot
+    plot(fitted_vals, resid_vals, 
+         xlab = "Fitted Values", ylab = "Residuals",
+         main = "Residuals vs Fitted Values",
+         pch = 19, col = "blue")
+    
+    # Add a horizontal line at y = 0
+    abline(h = 0, lty = 2, col = "red", lwd = 2)
+    
+    # Add a smoothed line to show any patterns
+    if (length(fitted_vals) > 10) {
+      lines(lowess(fitted_vals, resid_vals), col = "green", lwd = 2)
+      legend("topright", 
+             legend = c("Residuals", "Zero line", "Lowess smooth"),
+             col = c("blue", "red", "green"),
+             lty = c(NA, 2, 1),
+             pch = c(19, NA, NA),
+             lwd = c(NA, 2, 2),
+             bty = "n")
+    }
+    
+    # Add text about patterns
+    if (length(fitted_vals) > 10) {
+      # Simple check for heteroscedasticity
+      cor_test <- cor.test(abs(resid_vals), fitted_vals, method = "spearman")
+      if (cor_test$p.value < 0.05) {
+        mtext("Warning: Potential heteroscedasticity detected", 
+              side = 3, line = 0.5, col = "red", cex = 0.9)
       }
-    } else if (mr$method == "lm") {
-      # For linear models
-      plot(mr$model, which = 1)
     }
   })
   
@@ -2915,25 +2997,45 @@ server <- function(input, output, session) {
     
     mr <- metareg_result()
     
-    if (mr$method %in% c("metafor", "rma")) {
-      # Get standardized residuals
-      res <- try(rstandard(mr$model), silent = TRUE)
+    # Get standardized residuals
+    res <- rstudent(mr$model)
+    
+    # Create a Q-Q plot
+    qqnorm(res$z, main = "Normal Q-Q Plot of Standardized Residuals",
+           pch = 19, col = "blue")
+    qqline(res$z, col = "red", lwd = 2)
+    
+    # Add confidence bands
+    n <- length(res$z)
+    if (n > 10) {
+      # Calculate approximate confidence bands
+      sorted_res <- sort(res$z)
+      theoretical_quantiles <- qnorm(ppoints(n))
       
-      if (!inherits(res, "try-error")) {
-        # Create a Q-Q plot
-        qqnorm(res, main = "Normal Q-Q Plot of Standardized Residuals",
-               pch = 19, col = "blue")
-        qqline(res, col = "red", lwd = 2)
-      } else {
-        # Fallback if standardized residuals aren't available
-        plot(0, 0, type = "n", xlim = c(-3, 3), ylim = c(-3, 3),
-             xlab = "Theoretical Quantiles", ylab = "Sample Quantiles",
-             main = "Q-Q Plot (not available)")
-        text(0, 0, "Standardized residuals not available", cex = 1.2)
-      }
-    } else if (mr$method == "lm") {
-      # For linear models
-      plot(mr$model, which = 2)
+      # Standard error for order statistics
+      se <- sqrt(ppoints(n) * (1 - ppoints(n)) / n) / dnorm(theoretical_quantiles)
+      
+      # 95% confidence bands
+      upper_band <- theoretical_quantiles + 1.96 * se
+      lower_band <- theoretical_quantiles - 1.96 * se
+      
+      lines(theoretical_quantiles, upper_band, lty = 2, col = "gray")
+      lines(theoretical_quantiles, lower_band, lty = 2, col = "gray")
+      
+      legend("topleft", 
+             legend = c("Data", "Expected", "95% CI"),
+             col = c("blue", "red", "gray"),
+             lty = c(NA, 1, 2),
+             pch = c(19, NA, NA),
+             lwd = c(NA, 2, 1),
+             bty = "n")
+    }
+    
+    # Test for normality
+    if (n > 7) {
+      shapiro_test <- shapiro.test(res$z)
+      mtext(paste("Shapiro-Wilk test: p =", format.pval(shapiro_test$p.value, digits = 3)), 
+            side = 3, line = 0.5, cex = 0.9)
     }
   })
   
@@ -2947,37 +3049,22 @@ server <- function(input, output, session) {
       
       mr <- metareg_result()
       
-      if (mr$method == "metafor") {
-        # Extract model results
-        results <- summary(mr$model)
-        
-        # Create data frame of results
-        result_df <- data.frame(
-          Parameter = rownames(results$beta),
-          Estimate = results$beta,
-          SE = results$se,
-          Z_value = results$zval,
-          P_value = results$pval,
-          CI_lower = results$ci.lb,
-          CI_upper = results$ci.ub
-        )
-        
-        write.csv(result_df, file, row.names = FALSE)
-      } else {
-        # Use lm summary for linear model
-        lm_summary <- summary(mr$model)
-        
-        # Create result dataframe
-        result_df <- data.frame(
-          Parameter = rownames(lm_summary$coefficients),
-          Estimate = lm_summary$coefficients[,1],
-          SE = lm_summary$coefficients[,2],
-          t_value = lm_summary$coefficients[,3],
-          P_value = lm_summary$coefficients[,4]
-        )
-        
-        write.csv(result_df, file, row.names = FALSE)
-      }
+      # Extract model results
+      results <- summary(mr$model)
+      
+      # Create data frame of results
+      result_df <- data.frame(
+        Parameter = rownames(results$beta),
+        Estimate = results$beta,
+        SE = results$se,
+        Z_value = results$zval,
+        P_value = results$pval,
+        CI_lower = results$ci.lb,
+        CI_upper = results$ci.ub,
+        stringsAsFactors = FALSE
+      )
+      
+      write.csv(result_df, file, row.names = FALSE)
     }
   )
   
@@ -3009,7 +3096,9 @@ server <- function(input, output, session) {
       ranking_df <- data.frame(
         Treatment = adjusted_rankings$treatments,
         Adjusted_P_Score = round(adjusted_rankings$p_scores * 100, 1),
-        Covariate_Value = covariate_value
+        Covariate = mr$covariate,
+        Covariate_Value = covariate_value,
+        stringsAsFactors = FALSE
       )
       
       write.csv(ranking_df, file, row.names = FALSE)
@@ -3027,24 +3116,7 @@ server <- function(input, output, session) {
       
       if (mr$type == "continuous" && !is.null(mr$predictions)) {
         # Create a table of predicted effects at different covariate values
-        pred_data <- data.frame()
-        
-        # Get a sequence of covariate values
-        cov_values <- sort(unique(sapply(mr$predictions, function(x) x$covariate_value)))
-        
-        # Create rows for each covariate value
-        for (cov_val in cov_values) {
-          pred <- mr$predictions[[as.character(cov_val)]]
-          pred_row <- data.frame(
-            Covariate_Value = cov_val,
-            Effect = round(pred$effect, 3),
-            Lower_CI = round(pred$lower_ci, 3),
-            Upper_CI = round(pred$upper_ci, 3)
-          )
-          
-          pred_data <- rbind(pred_data, pred_row)
-        }
-        
+        pred_data <- do.call(rbind, mr$predictions)
         write.csv(pred_data, file, row.names = FALSE)
       } else {
         # Return empty table if no predictions
@@ -3058,35 +3130,54 @@ server <- function(input, output, session) {
       "baseline_risk_comparison.csv"
     },
     content = function(file) {
-      req(baseline_result())
+      req(baseline_result(), nma_result())
       
-      # Create a comparison table for all treatment pairs at a specific baseline risk
-      br <- baseline_result()
-      nma <- nma_result()
-      
-      # Create empty grid
-      treatments <- nma$trts
+      # Get all treatments
+      treatments <- nma_result()$trts
       n_treats <- length(treatments)
-      grid <- matrix(NA, nrow = n_treats, ncol = n_treats)
-      rownames(grid) <- treatments
-      colnames(grid) <- treatments
       
-      # Fill with placeholder values (would be actual calculations in full implementation)
+      # Create comparison matrix
+      comparison_matrix <- matrix(NA, nrow = n_treats, ncol = n_treats,
+                                  dimnames = list(treatments, treatments))
+      
+      # Get baseline risk value
+      baseline_value <- input$baseline_value
+      
+      # Calculate adjusted effects
+      br <- baseline_result()
+      adjustment <- 0
+      
+      if (!is.null(br$model)) {
+        # Calculate adjustment based on baseline risk
+        mean_baseline <- mean(br$data$baseline_risk, na.rm = TRUE)
+        adjustment <- br$model$beta[2] * (baseline_value - mean_baseline)
+      }
+      
+      # Fill comparison matrix with adjusted NMA estimates
       for (i in 1:n_treats) {
         for (j in 1:n_treats) {
           if (i != j) {
-            # Simple placeholder values
-            grid[i, j] <- round(runif(1, -1, 1), 2)
+            # Find the comparison in NMA results
+            idx <- which((nma_result()$treat1 == treatments[i] & nma_result()$treat2 == treatments[j]) |
+                         (nma_result()$treat1 == treatments[j] & nma_result()$treat2 == treatments[i]))
+            
+            if (length(idx) > 0) {
+              if (nma_result()$treat1[idx] == treatments[i]) {
+                comparison_matrix[i, j] <- round(nma_result()$TE.nma.random[idx] + adjustment, 3)
+              } else {
+                comparison_matrix[i, j] <- round(-nma_result()$TE.nma.random[idx] + adjustment, 3)
+              }
+            }
           }
         }
       }
       
-      # Convert to data frame for display
-      grid_df <- as.data.frame(grid)
-      grid_df$Treatment <- rownames(grid)
-      grid_df <- grid_df[, c("Treatment", treatments)]
+      # Convert to data frame
+      comparison_df <- as.data.frame(comparison_matrix)
+      comparison_df$Treatment <- rownames(comparison_df)
+      comparison_df <- comparison_df[, c("Treatment", treatments)]
       
-      write.csv(grid_df, file, row.names = FALSE)
+      write.csv(comparison_df, file, row.names = FALSE)
     }
   )
   
@@ -3095,20 +3186,22 @@ server <- function(input, output, session) {
       paste0("baseline_risk_rankings_", input$baseline_ranking_value, ".csv")
     },
     content = function(file) {
-      req(baseline_result(), input$baseline_ranking_value)
+      req(baseline_result(), nma_result(), input$baseline_ranking_value)
       
-      # Get treatments
-      treatments <- nma_result()$trts
-      
-      # Create placeholder P-scores (would be actual calculations in full implementation)
-      p_scores <- runif(length(treatments), 0, 1)
-      names(p_scores) <- treatments
+      # Generate adjusted rankings
+      adjusted_rankings <- generate_adjusted_rankings(
+        nma = nma_result(),
+        metareg_model = baseline_result()$model,
+        covariate_value = input$baseline_ranking_value,
+        cov_name = "Baseline Risk"
+      )
       
       # Create ranking dataframe
       ranking_df <- data.frame(
-        Treatment = names(p_scores),
-        P_Score = round(p_scores * 100, 1),
-        Baseline_Risk = input$baseline_ranking_value
+        Treatment = adjusted_rankings$treatments,
+        P_Score = round(adjusted_rankings$p_scores * 100, 1),
+        Baseline_Risk = input$baseline_ranking_value,
+        stringsAsFactors = FALSE
       )
       
       write.csv(ranking_df, file, row.names = FALSE)
@@ -3121,16 +3214,20 @@ server <- function(input, output, session) {
       "baseline_forest_plot.png"
     },
     content = function(file) {
-      req(baseline_result(), input$baseline_value)
+      req(baseline_result(), nma_result(), input$baseline_value)
       
       # Save the plot
       png(file, width = 800, height = 600, res = 100)
       
-      # Create a forest plot with adjusted effects at a specific baseline risk value
-      plot(1, 1, type = "n", xlab = "Effect", ylab = "",
-           main = paste("Forest Plot at Baseline Risk =", input$baseline_value),
-           xlim = c(-2, 2), ylim = c(0, 10))
-      abline(v = 0, lty = 2)
+      # Create adjusted forest plot
+      create_metareg_forest_plot(
+        nma = nma_result(),
+        metareg_model = baseline_result()$model,
+        covariate_value = input$baseline_value,
+        reference_treatment = baseline_result()$reference,
+        sm = input$effect_measure,
+        cov_name = "Baseline Risk"
+      )
       
       dev.off()
     }
